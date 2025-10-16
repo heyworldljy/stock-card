@@ -1,0 +1,281 @@
+
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>实时股市卡片（自托管）</title>
+<style>
+  :root{
+    --bg: rgba(255,255,255,0.06);
+    --card-bg: rgba(255,255,255,0.03);
+    --glass: rgba(255,255,255,0.04);
+    --radius: 12px;
+    --pad: 12px;
+    --muted: #bfc3c6;
+    --green: #16a34a;
+    --red: #ef4444;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft Yahei", "Helvetica Neue", Arial;
+  }
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#0b1220 0%, #0f1724 100%);color:#fff}
+  .container{display:flex;gap:14px;padding:16px;flex-wrap:wrap;align-items:flex-start}
+  .card{background:var(--card-bg);backdrop-filter:blur(6px);border-radius:var(--radius);padding:var(--pad);min-width:260px;width:320px;box-shadow:0 6px 18px rgba(2,6,23,0.6);border:1px solid rgba(255,255,255,0.04)}
+  .title{font-size:14px;color:var(--muted);margin-bottom:8px;text-align:center}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px dashed rgba(255,255,255,0.03)}
+  .row:last-child{border-bottom:0}
+  .symbol{display:flex;flex-direction:column;}
+  .symbol .name{font-weight:600;font-size:15px}
+  .symbol .code{font-size:12px;color:var(--muted);margin-top:2px}
+  .price{font-size:18px;font-weight:700}
+  .change{font-size:13px;margin-top:4px}
+  .up{color:var(--red)}
+  .down{color:var(--green)}
+  .spark{width:90px;height:28px}
+  .controls{display:flex;gap:8px;align-items:center;margin-top:10px;justify-content:center}
+  .small{font-size:12px;color:var(--muted)}
+  .note{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+  .badge{font-size:11px;padding:6px 8px;border-radius:999px;background:var(--glass);color:var(--muted);border:1px solid rgba(255,255,255,0.03)}
+  .link{color:var(--muted);text-decoration:underline;cursor:pointer}
+  @media (max-width:480px){
+    .container{padding:10px}
+    .card{width:100%}
+  }
+</style>
+</head>
+<body>
+<div class="container" id="container"></div>
+
+<script>
+/*
+  简介：
+  - 使用新浪行情接口（hq.sinajs.cn）拉取实时数据
+  - 可展示多个代码（指数或个股），并在 localStorage 存储最近若干次价格用于绘制 sparkline
+  - 默认每 30 秒刷新（可在页面内调整）
+  说明：
+  - 若你将此文件托管到 Netlify / GitHub Pages，并在浏览器主题"卡片"中填写该页面的 URL，浏览器会把它渲染为一个嵌入卡片。
+  - 如果出现跨域或无法请求情况，请尝试把页面放到与你浏览器主题同源的环境或使用 HTTPS（推荐）。
+*/
+
+/* ========== 配置区（可修改） ========== */
+// 要展示的代码和显示名称（sina 格式）
+const ITEMS = [
+  { code: 'sh000001', name: '上证指数' },
+  { code: 'sz399001', name: '深证成指' },
+  { code: 'sz399006', name: '创业板指' },
+  { code: 'sh000300', name: '沪深300' },
+  { code: 'sh000688', name: '科创50' }, // 如需调整，请修改此处
+  { code: 'sz002050', name: '三花智控' },
+];
+
+// 刷新间隔（毫秒）
+let REFRESH_MS = 30000;
+
+// sparkline 点数（保留最近 N 次价格）
+const MAX_POINTS = 40;
+/* ======================================= */
+
+const container = document.getElementById('container');
+
+function makeCard(item){
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.dataset.code = item.code;
+
+  card.innerHTML = `
+    <div class="title">${item.name} <span style="margin-left:8px" class="badge">${item.code}</span></div>
+    <div class="row">
+      <div class="symbol">
+        <div class="name" id="name-${item.code}">-</div>
+        <div class="code" id="code-${item.code}">${item.code}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="price" id="price-${item.code}">--</div>
+        <div class="change" id="chg-${item.code}">--</div>
+      </div>
+    </div>
+    <div class="row" style="border-bottom:0;justify-content:space-between">
+      <canvas class="spark" id="spark-${item.code}" width="180" height="48"></canvas>
+      <div style="text-align:right">
+        <div class="small" id="extra-${item.code}">-</div>
+        <div style="height:6px"></div>
+        <div><a id="link-${item.code}" class="link" target="_blank">详情</a></div>
+      </div>
+    </div>
+  `;
+  return card;
+}
+
+function build(){
+  container.innerHTML = '';
+  ITEMS.forEach(it=>{
+    container.appendChild(makeCard(it));
+  });
+  // controls
+  const ctrl = document.createElement('div');
+  ctrl.style.width='100%';
+  ctrl.style.display='flex';
+  ctrl.style.justifyContent='center';
+  ctrl.innerHTML = `<div class="note">自动刷新：<span id="intervalShow">${REFRESH_MS/1000}s</span> ・ 可在页面顶部控制刷新频率并修改代码列表</div>`;
+  container.appendChild(ctrl);
+}
+
+function sinaUrl(codes){
+  return 'https://hq.sinajs.cn/list=' + codes.join(',');
+}
+
+function parseSina(text){
+  // 返回 map code -> {name, price, change, percent, open, high, low, yestclose}
+  const lines = text.split('\n').filter(Boolean);
+  const out = {};
+  lines.forEach(line=>{
+    // line 格式: var hq_str_sh000001="上证指数,3247.01,23.45,0.73,...";
+    const m = line.match(/var hq_str_(\w+)="(.*)";?/);
+    if(!m) return;
+    const code = m[1];
+    const csv = m[2].split(',');
+    // 不同代码字段略有差异，这里按常见格式解析（指数和个股通常类似）
+    const name = csv[0] || code;
+    const price = parseFloat(csv[1]) || 0;
+    const open = parseFloat(csv[2]) || 0;
+    const yesterday_close = parseFloat(csv[3]) || 0;
+    // 部分接口字段顺序可能不同，下面我们按常见值计算
+    let change = price - yesterday_close;
+    let percent = yesterday_close ? (change / yesterday_close * 100) : 0;
+    // 备用：如果字段 3 是当前价（不同接口），做容错
+    // 某些接口的字段位置可能不同，尽量不致命
+    out[code] = { name, price, change: Number(change.toFixed(2)), percent: Number(percent.toFixed(2)), open, yesterday_close, raw: csv };
+  });
+  return out;
+}
+
+function drawSpark(canvas, points, up){
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  if(points.length < 2) return;
+  const mn = Math.min(...points);
+  const mx = Math.max(...points);
+  const span = (mx - mn) || 1;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for(let i=0;i<points.length;i++){
+    const x = (i/(points.length-1))*(w-6) + 3;
+    const y = h - 4 - ((points[i]-mn)/span)*(h-8);
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.strokeStyle = up ? '#ef4444' : '#16a34a';
+  ctx.stroke();
+
+  // small gradient fill
+  ctx.lineTo(w-3,h-3);
+  ctx.lineTo(3,h-3);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0,0,0,h);
+  if(up){
+    grad.addColorStop(0, 'rgba(239,68,68,0.12)');
+    grad.addColorStop(1, 'rgba(239,68,68,0.02)');
+  } else {
+    grad.addColorStop(0, 'rgba(22,163,74,0.12)');
+    grad.addColorStop(1, 'rgba(22,163,74,0.02)');
+  }
+  ctx.fillStyle = grad;
+  ctx.fill();
+}
+
+function loadSeries(code){
+  const key = 'series_'+code;
+  try{
+    const raw = localStorage.getItem(key);
+    if(!raw) return [];
+    const arr = JSON.parse(raw);
+    if(!Array.isArray(arr)) return [];
+    return arr.slice(-MAX_POINTS);
+  }catch(e){
+    return [];
+  }
+}
+function saveSeries(code, arr){
+  const key = 'series_'+code;
+  localStorage.setItem(key, JSON.stringify(arr.slice(-MAX_POINTS)));
+}
+
+async function fetchAndUpdate(){
+  const codes = ITEMS.map(i=>i.code);
+  const url = sinaUrl(codes);
+  try{
+    const res = await fetch(url, {cache:'no-store'});
+    const txt = await res.text();
+    const data = parseSina(txt);
+    ITEMS.forEach(it=>{
+      const d = data[it.code];
+      const priceEl = document.getElementById('price-'+it.code);
+      const chgEl = document.getElementById('chg-'+it.code);
+      const nameEl = document.getElementById('name-'+it.code);
+      const extraEl = document.getElementById('extra-'+it.code);
+      const linkEl = document.getElementById('link-'+it.code);
+      const canvas = document.getElementById('spark-'+it.code);
+      if(!d){ // 未解析到
+        nameEl.textContent = it.name;
+        priceEl.textContent = '--';
+        chgEl.textContent = '--';
+        extraEl.textContent = '无数据';
+        linkEl.href = 'https://finance.sina.com.cn/';
+        return;
+      }
+      nameEl.textContent = d.name || it.name;
+      // price formatting
+      priceEl.textContent = (d.price===0? '--' : d.price.toFixed(2));
+      const sign = d.change > 0 ? '+' : (d.change < 0 ? '' : '');
+      const up = d.change > 0;
+      const chgTxt = `${sign}${d.change.toFixed(2)} (${sign}${d.percent.toFixed(2)}%)`;
+      chgEl.textContent = chgTxt;
+      chgEl.className = 'change ' + (up ? 'up' : 'down');
+
+      extraEl.textContent = `昨收 ${d.yesterday_close?d.yesterday_close.toFixed(2):'-'} · 今开 ${d.open?d.open.toFixed(2):'-'}`;
+
+      // details link to sina quote page (适配指数/个股)
+      let link = 'https://finance.sina.com.cn/';
+      if(it.code.startsWith('sh') || it.code.startsWith('sz')){
+        // try common mapping
+        link = 'https://finance.sina.com.cn/realstock/company/' + it.code + '/nc.shtml';
+      }
+      linkEl.href = link;
+
+      // sparkline: save series and draw
+      const series = loadSeries(it.code);
+      // append price if valid
+      if(d.price && !isNaN(d.price) && d.price>0){
+        series.push(d.price);
+        while(series.length > MAX_POINTS) series.shift();
+        saveSeries(it.code, series);
+      }
+      drawSpark(canvas, series, up);
+    });
+  }catch(err){
+    console.error('fetch error', err);
+    // on error, show message
+    ITEMS.forEach(it=>{
+      const extraEl = document.getElementById('extra-'+it.code);
+      if(extraEl) extraEl.textContent = '网络或跨域错误，请检查托管与 HTTPS';
+    });
+  }
+}
+
+function start(){
+  build();
+  fetchAndUpdate();
+  window._timer = setInterval(fetchAndUpdate, REFRESH_MS);
+}
+
+// simple UI: allow changing refresh interval via keyboard: press '-' or '=' to adjust
+window.addEventListener('keydown', (e)=>{
+  if(e.key === '='){ REFRESH_MS = Math.max(5000, REFRESH_MS - 5000); clearInterval(window._timer); window._timer = setInterval(fetchAndUpdate, REFRESH_MS); document.getElementById('intervalShow').textContent = REFRESH_MS/1000 + 's'; }
+  if(e.key === '-'){ REFRESH_MS = REFRESH_MS + 5000; clearInterval(window._timer); window._timer = setInterval(fetchAndUpdate, REFRESH_MS); document.getElementById('intervalShow').textContent = REFRESH_MS/1000 + 's'; }
+});
+
+// On load
+start();
+
+</script>
+</body>
+</html>
